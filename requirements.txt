@@ -1,0 +1,9 @@
+torch
+transformers
+qwen-vl-utils
+pillow
+librosa
+imageio-ffmpeg
+pypdf
+python-docx
+numpy
