@@ -1,0 +1,463 @@
+import os
+import re
+import shlex
+import subprocess
+import tempfile
+from datetime import datetime
+
+import docx
+import imageio_ffmpeg
+import librosa
+import numpy as np
+import pypdf
+import torch
+from PIL import Image
+from qwen_vl_utils import process_vision_info
+from transformers import (
+    AutoProcessor,
+    Qwen2_5_VLForConditionalGeneration,
+    pipeline,
+)
+
+# ==============================================================================
+# CONFIGURATION & LIMITS
+# ==============================================================================
+MAX_IMAGES = 5
+MAX_AUDIO_SECONDS = 3600  # 1 hour
+MAX_VIDEO_SECONDS = 300   # 5 minutes
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".tiff", ".tif", ".bmp", ".gif", ".ico"}
+DOC_EXTS = {".pdf", ".docx", ".txt", ".md", ".csv"}
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus", ".wma"}
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".3gp", ".wmv"}
+
+VLM_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+WHISPER_MODEL_ID = "openai/whisper-small"
+TEXT_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Global cached model instances (so models load only once per session)
+_VLM_MODEL = None
+_VLM_PROCESSOR = None
+_WHISPER_PIPE = None
+_TEXT_PIPE = None
+
+
+# ==============================================================================
+# 1. LOCAL MODEL LOADERS (100% OFFLINE FROM CACHE)
+# ==============================================================================
+def load_qwen_vision_language_model():
+    """Loads Qwen2.5-VL-3B-Instruct locally from Hugging Face cache."""
+    global _VLM_MODEL, _VLM_PROCESSOR
+    if _VLM_MODEL is None or _VLM_PROCESSOR is None:
+        _VLM_PROCESSOR = AutoProcessor.from_pretrained(
+            VLM_MODEL_ID,
+            min_pixels=256 * 28 * 28,
+            max_pixels=768 * 28 * 28,
+        )
+        _VLM_MODEL = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            VLM_MODEL_ID,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+        )
+        _VLM_MODEL.eval()
+    return _VLM_MODEL, _VLM_PROCESSOR
+
+
+def load_whisper_speech_model():
+    """Loads Whisper-small locally with 30-second chunking for long audio."""
+    global _WHISPER_PIPE
+    if _WHISPER_PIPE is None:
+        _WHISPER_PIPE = pipeline(
+            "automatic-speech-recognition",
+            model=WHISPER_MODEL_ID,
+            chunk_length_s=30,
+            stride_length_s=5,
+            device=-1,
+        )
+    return _WHISPER_PIPE
+
+
+def load_ai_description_model():
+    """Loads Qwen2.5-0.5B-Instruct locally via Transformers text-generation pipeline."""
+    global _TEXT_PIPE
+    if _TEXT_PIPE is None:
+        _TEXT_PIPE = pipeline(
+            "text-generation",
+            model=TEXT_MODEL_ID,
+            torch_dtype=torch.float32,
+            device=-1,
+        )
+    return _TEXT_PIPE
+
+
+# ==============================================================================
+# 2. MEDIA INSPECTION & UTILITY HELPERS
+# ==============================================================================
+def format_duration_hms(seconds):
+    """Formats seconds into HH:MM:SS."""
+    if seconds is None:
+        return "Unknown"
+    total = int(round(seconds))
+    hrs, rem = divmod(total, 3600)
+    mins, secs = divmod(rem, 60)
+    return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+
+
+def get_media_duration_and_audio_flag(file_path):
+    """Uses bundled imageio-ffmpeg binary to inspect duration and audio stream presence."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [ffmpeg_exe, "-i", file_path]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    stderr = proc.stderr
+
+    duration = None
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+    if match:
+        hrs, mins, secs = float(match.group(1)), float(match.group(2)), float(match.group(3))
+        duration = hrs * 3600 + mins * 60 + secs
+
+    has_audio = bool(re.search(r"Stream #\d+:\d+.*Audio:", stderr))
+    return duration, has_audio
+
+
+def detect_media_type(file_path):
+    """Detects whether a file is image, document, audio, video, or unsupported."""
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext in IMAGE_EXTS:
+        with Image.open(file_path) as img:
+            return "image", {
+                "format": img.format or ext.lstrip(".").upper(),
+                "width": img.width,
+                "height": img.height,
+            }
+
+    if ext in DOC_EXTS:
+        return "document", {"format": ext.lstrip(".").upper()}
+
+    if ext in AUDIO_EXTS:
+        duration, _ = get_media_duration_and_audio_flag(file_path)
+        return "audio", {"format": ext.lstrip(".").upper(), "duration": duration}
+
+    if ext in VIDEO_EXTS:
+        duration, has_audio = get_media_duration_and_audio_flag(file_path)
+        return "video", {
+            "format": ext.lstrip(".").upper(),
+            "duration": duration,
+            "has_audio": has_audio,
+        }
+
+    return "unsupported", {"format": ext}
+
+
+def clean_user_input_paths(raw_input):
+    """Cleans PowerShell drag-and-drop paths (handles `& '...'`, quotes, and folders)."""
+    cleaned = raw_input.strip()
+    if cleaned.startswith("& "):
+        cleaned = cleaned[2:].strip()
+
+    try:
+        tokens = shlex.split(cleaned, posix=False)
+    except ValueError:
+        tokens = [cleaned]
+
+    resolved_files = []
+    for token in tokens:
+        path = token.strip().strip('"').strip("'")
+        if not path:
+            continue
+        if os.path.isdir(path):
+            for entry in sorted(os.listdir(path)):
+                full_entry = os.path.join(path, entry)
+                if os.path.isfile(full_entry):
+                    resolved_files.append(full_entry)
+        elif os.path.isfile(path):
+            resolved_files.append(path)
+    return resolved_files
+
+
+# ==============================================================================
+# 3. IMAGE ANALYSIS (VISION + LINE-BY-LINE DETAILS)
+# ==============================================================================
+def generate_detailed_description_from_pil_image(pil_image, custom_prompt=None):
+    """Generates a visual overview and exact line-by-line text extraction from a PIL Image."""
+    model, processor = load_qwen_vision_language_model()
+
+    prompt_text = custom_prompt or (
+        "Analyze this image thoroughly:\n"
+        "1. Visual Overview: Describe what this image is, its layout, colors, and main subject.\n"
+        "2. Line-by-Line Details: Transcribe EVERY visible line of text, number, label, amount, "
+        "date, time, and ID in exact top-to-bottom order without skipping anything."
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pil_image.convert("RGB")},
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+    text_input = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text_input],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=512, do_sample=False)
+
+    trimmed_ids = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    return processor.batch_decode(trimmed_ids, skip_special_tokens=True)[0].strip()
+
+
+def analyze_single_image_file(file_path, custom_prompt=None):
+    """Opens an image file from disk and runs Qwen2.5-VL analysis."""
+    with Image.open(file_path) as img:
+        return generate_detailed_description_from_pil_image(img, custom_prompt=custom_prompt)
+
+
+# ==============================================================================
+# 4. DOCUMENT EXTRACTION (PDF, DOCX, TXT, MD, CSV)
+# ==============================================================================
+def extract_document_content(file_path):
+    """Extracts plain text from PDF, DOCX, TXT, MD, or CSV files."""
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".pdf":
+        reader = pypdf.PdfReader(file_path)
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n\n".join(pages).strip()
+
+    if ext == ".docx":
+        doc = docx.Document(file_path)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        return "\n".join(paragraphs).strip()
+
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read().strip()
+
+
+# ==============================================================================
+# 5. SPEECH TRANSCRIPTION (AUDIO & VIDEO AUDIO TRACKS)
+# ==============================================================================
+def transcribe_speech_from_file(file_path, language=None):
+    """Converts audio/video to 16kHz mono WAV via bundled FFmpeg and transcribes with Whisper."""
+    whisper_pipe = load_whisper_speech_model()
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        wav_path = os.path.join(tmp_dir, "normalized_16k.wav")
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i", file_path,
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            wav_path,
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+        audio_array, _ = librosa.load(wav_path, sr=16000, mono=True)
+        if audio_array.size == 0:
+            return "[No spoken audio detected]"
+
+        generate_kwargs = {"task": "transcribe"}
+        if language:
+            generate_kwargs["language"] = language
+
+        result = whisper_pipe(
+            {"array": audio_array.astype(np.float32), "sampling_rate": 16000},
+            generate_kwargs=generate_kwargs,
+        )
+        return result.get("text", "").strip()
+
+
+# ==============================================================================
+# 6. VIDEO VISUAL SCENE SAMPLING
+# ==============================================================================
+def analyze_video_visual_scenes(file_path, duration):
+    """Extracts up to 5 evenly spaced key frames from a video and describes each scene."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    safe_duration = duration if (duration and duration > 0) else 10.0
+    num_frames = min(5, max(1, int(safe_duration // 15) + 1))
+
+    timestamps = [
+        round((safe_duration * (i + 0.5)) / num_frames, 2)
+        for i in range(num_frames)
+    ]
+
+    scene_notes = []
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for idx, ts in enumerate(timestamps, start=1):
+            frame_path = os.path.join(tmp_dir, f"frame_{idx}.jpg")
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-ss", str(ts),
+                "-i", file_path,
+                "-frames:v", "1",
+                "-q:v", "2",
+                frame_path,
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if os.path.exists(frame_path):
+                with Image.open(frame_path) as frame_img:
+                    desc = generate_detailed_description_from_pil_image(
+                        frame_img,
+                        custom_prompt="Briefly describe what is happening in this video frame and read any visible text.",
+                    )
+                scene_notes.append(f"[{format_duration_hms(ts)}] {desc}")
+
+    return "\n\n".join(scene_notes) if scene_notes else "No visual frames could be extracted."
+
+
+# ==============================================================================
+# 7. TEXT SUMMARIZATION & AI DESCRIPTION (QWEN2.5-0.5B-INSTRUCT)
+# ==============================================================================
+def generate_ai_description(raw_text, content_label="content"):
+    """Summarizes extracted document text, audio transcript, or video context locally."""
+    cleaned = re.sub(r"\s+", " ", raw_text or "").strip()
+    if not cleaned:
+        return f"No readable text or speech found in this {content_label}."
+
+    truncated = " ".join(cleaned.split()[:2000])
+    generator = load_ai_description_model()
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a concise, accurate AI assistant. Summarize the key points clearly.",
+        },
+        {
+            "role": "user",
+            "content": f"Provide a clear, structured summary of the following {content_label}:\n\n{truncated}",
+        },
+    ]
+
+    output = generator(messages, max_new_tokens=250, do_sample=False)
+    generated = output[0]["generated_text"]
+    return generated[-1]["content"].strip() if isinstance(generated, list) else str(generated).strip()
+
+
+# ==============================================================================
+# 8. CLI ENTRY POINT
+# ==============================================================================
+def main():
+    print("===============================================================")
+    print("  Local Multimodal AI File Analyzer (100% Offline & API-Free)  ")
+    print("===============================================================")
+    print("Supported Inputs:")
+    print(f"- Up to {MAX_IMAGES} Images (JPG, PNG, WEBP, AVIF, TIFF, BMP, GIF, ICO)")
+    print("- Documents      (PDF, DOCX, TXT, MD, CSV)")
+    print("- Audio <= 1 hr  (MP3, WAV, M4A, AAC, OGG, FLAC, OPUS, WMA)")
+    print("- Video <= 5 min (MP4, MKV, MOV, AVI, WEBM, FLV, 3GP, WMV)\n")
+
+    raw_input = input("Drag & drop file(s) or folder here: ")
+    files = clean_user_input_paths(raw_input)
+
+    if not files:
+        print("No valid file path detected.")
+        return
+
+    classified = []
+    for path in files:
+        m_type, meta = detect_media_type(path)
+        classified.append((path, m_type, meta))
+
+    # Batch image check
+    if len(classified) > 1:
+        if len(classified) > MAX_IMAGES:
+            print(f"Error: Maximum {MAX_IMAGES} images allowed at once (you provided {len(classified)}).")
+            return
+        if not all(m_type == "image" for _, m_type, _ in classified):
+            print("Error: Multiple files are only supported for images (up to 5).")
+            return
+
+        for idx, (path, _, meta) in enumerate(classified, start=1):
+            print(f"\n================ Image [{idx}/{len(classified)}] ================")
+            print(f"File Path     : {path}")
+            print(f"Detected Type : Image ({meta['format']}) | {meta['width']}x{meta['height']} px")
+            print("----------------------------------------------")
+            print(analyze_single_image_file(path))
+        return
+
+    # Single file processing
+    file_path, media_type, meta = classified[0]
+    stat = os.stat(file_path)
+    size_mb = stat.st_size / (1024 * 1024)
+    mod_time = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    print("\n================ File Summary ================")
+    print(f"File Path     : {file_path}")
+    print(f"File Size     : {size_mb:.2f} MB")
+    print(f"Last Modified : {mod_time}")
+
+    if media_type == "unsupported":
+        print(f"Detected Type : Unsupported ({meta['format']})")
+        print("==============================================")
+        return
+
+    if media_type == "image":
+        print(f"Detected Type : Image ({meta['format']}) | {meta['width']}x{meta['height']} px")
+        print("----------------------------------------------")
+        print("AI Description (Visual & Line-by-Line):")
+        print("[Local AI - Vision] Extracting full visual overview and line-by-line details...")
+        try:
+            print(analyze_single_image_file(file_path))
+        except Exception as exc:
+            print(f"Failed to analyze image: {exc}")
+
+    elif media_type == "document":
+        print(f"Detected Type : Document ({meta['format']})")
+        print("----------------------------------------------")
+        raw_text = extract_document_content(file_path)
+        print("AI Summary:")
+        print(generate_ai_description(raw_text, content_label="document"))
+
+    elif media_type == "audio":
+        duration = meta.get("duration")
+        print(f"Detected Type : Audio ({meta['format']}) | Duration: {format_duration_hms(duration)}")
+        if duration and duration > MAX_AUDIO_SECONDS:
+            print("Error: Audio exceeds 1-hour limit.")
+            return
+        lang = input("Language (Enter for Auto, or type telugu/english/hindi): ").strip().lower() or None
+        print("----------------------------------------------")
+        transcript = transcribe_speech_from_file(file_path, language=lang)
+        print("Transcript:\n", transcript)
+        print("\nAI Summary:\n", generate_ai_description(transcript, content_label="audio transcript"))
+
+    elif media_type == "video":
+        duration = meta.get("duration")
+        print(f"Detected Type : Video ({meta['format']}) | Duration: {format_duration_hms(duration)}")
+        if duration and duration > MAX_VIDEO_SECONDS:
+            print("Error: Video exceeds 5-minute limit.")
+            return
+        lang = None
+        if meta.get("has_audio"):
+            lang = input("Language (Enter for Auto, or type telugu/english/hindi): ").strip().lower() or None
+        print("----------------------------------------------")
+        visuals = analyze_video_visual_scenes(file_path, duration)
+        transcript = transcribe_speech_from_file(file_path, language=lang) if meta.get("has_audio") else "[No audio track]"
+        print("Visual Timeline:\n", visuals)
+        print("\nTranscript:\n", transcript)
+        print("\nOverall AI Summary:\n", generate_ai_description(f"{visuals}\n{transcript}", content_label="video"))
+
+    print("==============================================")
+
+
+if __name__ == "__main__":
+    main()
