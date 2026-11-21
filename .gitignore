@@ -3,3 +3,6 @@ venvaimm/
 __pycache__/
 *.pyc
 .env
+
+venvaimm/
+*_AI_Report_*.txt
